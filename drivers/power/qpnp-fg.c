@@ -314,7 +314,9 @@ static int fg_debug_mask;
 module_param_named(
 	debug_mask, fg_debug_mask, int, S_IRUSR | S_IWUSR
 );
-static int fg_reset_on_lockup=1;
+
+static int fg_reset_on_lockup = 1;
+
 static int fg_sense_type = -EINVAL;
 static int fg_restart;
 
@@ -539,7 +541,6 @@ struct fg_chip {
 	bool			charging_disabled;
 	bool			use_vbat_low_empty_soc;
 	bool			fg_shutdown;
-	bool			skip_first_estimate;
 	struct delayed_work	update_jeita_setting;
 	struct delayed_work	update_sram_data;
 	struct delayed_work	update_temp_work;
@@ -3343,7 +3344,7 @@ static int fg_power_get_property(struct power_supply *psy,
 		val->intval = get_sram_prop_now(chip, FG_DATA_CC_CHARGE);
 		break;
 	case POWER_SUPPLY_PROP_HI_POWER:
-		val->intval = chip->bcl_lpm_disabled;
+		val->intval = !!chip->bcl_lpm_disabled;
 		break;
 	default:
 		return -EINVAL;
@@ -4836,8 +4837,7 @@ static irqreturn_t fg_first_soc_irq_handler(int irq, void *_chip)
 	if (chip->power_supply_registered)
 		power_supply_changed(&chip->bms_psy);
 
-	if (!chip->skip_first_estimate)
-		complete_all(&chip->first_soc_done);
+	complete_all(&chip->first_soc_done);
 
 	return IRQ_HANDLED;
 }
@@ -5414,6 +5414,7 @@ static int fg_config_esr_extract(struct fg_chip *chip, bool disable)
 	}
 
 	chip->esr_extract_disabled = disable;
+	if (fg_debug_mask & FG_STATUS)
 		pr_info("ESR extract is %sabled\n", disable ? "dis" : "en");
 done:
 	fg_mem_release(chip);
@@ -5499,6 +5500,7 @@ static void discharge_gain_work(struct work_struct *work)
 #define BATT_PROFILE_OFFSET		0x4C0
 #define PROFILE_INTEGRITY_REG		0x53C
 #define PROFILE_INTEGRITY_BIT		BIT(0)
+#define FIRST_EST_DONE_BIT		BIT(5)
 #define MAX_TRIES_FIRST_EST		3
 #define FIRST_EST_WAIT_MS		2000
 #define PROFILE_LOAD_TIMEOUT_MS		5000
@@ -5570,9 +5572,7 @@ try_again:
 	}
 
 	/* unset the restart bits so the fg doesn't continuously restart */
-	reg = RESTART_GO;
-	if (!chip->skip_first_estimate)
-		reg |= REDO_FIRST_ESTIMATE;
+	reg = REDO_FIRST_ESTIMATE | RESTART_GO;
 	rc = fg_masked_write(chip, chip->soc_base + SOC_RESTART,
 			reg, 0, 1);
 	if (rc) {
@@ -5634,28 +5634,27 @@ try_again:
 	/* decrement the user count so that memory access can be released */
 	fg_release_access_if_necessary(chip);
 
-	if (!chip->skip_first_estimate) {
-		/*
-		 * make sure that the first estimate has completed
-		 * in case of a hotswap
-		 */
-		rc = wait_for_completion_interruptible_timeout(
-				&chip->first_soc_done,
-				msecs_to_jiffies(PROFILE_LOAD_TIMEOUT_MS));
-		if (rc <= 0) {
-			pr_err("transaction timed out rc=%d\n", rc);
-			rc = -ETIMEDOUT;
-			goto fail;
-		}
+	/*
+	 * make sure that the first estimate has completed
+	 * in case of a hotswap
+	 */
+	rc = wait_for_completion_interruptible_timeout(&chip->first_soc_done,
+			msecs_to_jiffies(PROFILE_LOAD_TIMEOUT_MS));
+	if (rc <= 0) {
+		pr_err("transaction timed out rc=%d\n", rc);
+		rc = -ETIMEDOUT;
+		goto fail;
+	}
 
-		/*
-		 * reinitialize the completion so that the driver knows when the
-		 * restart finishes
-		 */
-		reinit_completion(&chip->first_soc_done);
-	} else {
-		/* Wait for 2 seconds in case of a hotswap */
-		msleep(FIRST_EST_WAIT_MS);
+	/*
+	 * reinitialize the completion so that the driver knows when the restart
+	 * finishes
+	 */
+	reinit_completion(&chip->first_soc_done);
+
+	if (chip->esr_pulse_tune_en) {
+		fg_stay_awake(&chip->esr_extract_wakeup_source);
+		schedule_work(&chip->esr_extract_config_work);
 	}
 
 	/*
@@ -5669,9 +5668,7 @@ try_again:
 		goto fail;
 	}
 
-	reg = RESTART_GO;
-	if (!chip->skip_first_estimate)
-		reg |= REDO_FIRST_ESTIMATE;
+	reg = REDO_FIRST_ESTIMATE | RESTART_GO;
 	rc = fg_masked_write(chip, chip->soc_base + SOC_RESTART,
 			reg, reg, 1);
 	if (rc) {
@@ -5679,22 +5676,22 @@ try_again:
 		goto fail;
 	}
 
-	if (!chip->skip_first_estimate) {
-		/* wait for the first estimate to complete */
-		rc = wait_for_completion_interruptible_timeout(
-				&chip->first_soc_done,
-				msecs_to_jiffies(PROFILE_LOAD_TIMEOUT_MS));
-		if (rc <= 0) {
-			pr_err("transaction timed out rc=%d\n", rc);
-			rc = -ETIMEDOUT;
-			goto fail;
-		}
-		if (!is_first_est_done(chip))
-			pr_err("Battery profile reloading failed, no first estimate\n");
-	} else {
-		/* Wait for 2 seconds after a restart */
-		msleep(FIRST_EST_WAIT_MS);
+	/* wait for the first estimate to complete */
+	rc = wait_for_completion_interruptible_timeout(&chip->first_soc_done,
+			msecs_to_jiffies(PROFILE_LOAD_TIMEOUT_MS));
+	if (rc <= 0) {
+		pr_err("transaction timed out rc=%d\n", rc);
+		rc = -ETIMEDOUT;
+		goto fail;
 	}
+	rc = fg_read(chip, &reg, INT_RT_STS(chip->soc_base), 1);
+	if (rc) {
+		pr_err("spmi read failed: addr=%03X, rc=%d\n",
+				INT_RT_STS(chip->soc_base), rc);
+		goto fail;
+	}
+	if ((reg & FIRST_EST_DONE_BIT) == 0)
+		pr_err("Battery profile reloading failed, no first estimate\n");
 
 	rc = fg_masked_write(chip, chip->soc_base + SOC_BOOT_MOD,
 			NO_OTP_PROF_RELOAD, 0, 1);
@@ -5703,19 +5700,12 @@ try_again:
 		goto fail;
 	}
 	/* unset the restart bits so the fg doesn't continuously restart */
-	reg = RESTART_GO;
-	if (!chip->skip_first_estimate)
-		reg |= REDO_FIRST_ESTIMATE;
+	reg = REDO_FIRST_ESTIMATE | RESTART_GO;
 	rc = fg_masked_write(chip, chip->soc_base + SOC_RESTART,
 			reg, 0, 1);
 	if (rc) {
 		pr_err("failed to unset fg restart: %d\n", rc);
 		goto fail;
-	}
-
-	if (chip->esr_pulse_tune_en) {
-		fg_stay_awake(&chip->esr_extract_wakeup_source);
-		schedule_work(&chip->esr_extract_config_work);
 	}
 
 	/* restore the battery temperature reading here */
@@ -6015,8 +6005,6 @@ done:
 		rc = fg_backup_sram_registers(chip, false);
 		if (rc)
 			pr_err("Couldn't restore sram registers\n");
-		else
-			pr_info("IMA error recovery done...\n");
 
 		/* Read the cycle counter back from FG SRAM */
 		if (chip->cyc_ctr.en)
@@ -6645,8 +6633,6 @@ static int fg_of_init(struct fg_chip *chip)
 	chip->use_vbat_low_empty_soc = of_property_read_bool(node,
 					"qcom,fg-use-vbat-low-empty-soc");
 
-	chip->skip_first_estimate = of_property_read_bool(node,
-					"qcom,fg-skip-first-estimate");
 	OF_READ_PROPERTY(chip->batt_temp_low_limit,
 			"fg-batt-temp-low-limit", rc, BATT_TEMP_LOW_LIMIT);
 

@@ -5056,6 +5056,8 @@ if(chip->re_detect_charger_type_status==false)
 	/* Clear typec current status */
 	if (chip->typec_psy)
 		chip->typec_current_ma = 0;
+	/* cancel/wait for hvdcp pending work if any */
+	cancel_delayed_work_sync(&chip->hvdcp_det_work);
 	smbchg_change_usb_supply_type(chip, POWER_SUPPLY_TYPE_UNKNOWN);
 	if (!chip->skip_usb_notification) {
 		pr_smb(PR_MISC, "setting usb psy present = %d\n",
@@ -5093,6 +5095,7 @@ if(chip->re_detect_charger_type_status==false)
 		restore_from_hvdcp_detection(chip);
 	if(chip->re_detect_charger_type_status==false)
 	{
+		// oneplus fastcharge stuff
 	}
 }
 
@@ -5985,6 +5988,10 @@ static int smbchg_prepare_for_pulsing_lite(struct smbchg_chip *chip)
 out:
 	chip->hvdcp_3_det_ignore_uv = false;
 	restore_from_hvdcp_detection(chip);
+	if (!is_src_detect_high(chip)) {
+		pr_smb(PR_MISC, "HVDCP removed - force removal\n");
+		update_usb_status(chip, 0, true);
+	}
 	return rc;
 }
 
@@ -6004,6 +6011,10 @@ static int smbchg_unprepare_for_pulsing_lite(struct smbchg_chip *chip)
 	if (rc < 0)
 		pr_err("Couldn't retract HVDCP ICL vote rc=%d\n", rc);
 
+	if (!is_src_detect_high(chip)) {
+		pr_smb(PR_MISC, "HVDCP removed\n");
+		update_usb_status(chip, 0, 0);
+	}
 	smbchg_handle_hvdcp3_disable(chip);
 
 	return rc;
@@ -7345,9 +7356,10 @@ static int smbchg_hw_init(struct smbchg_chip *chip)
 	}
 
 	rc = smbchg_sec_masked_write(chip, chip->misc_base + TRIM_OPTIONS_7_0,
-			INPUT_MISSING_POLLER_EN_BIT, 0);
+			INPUT_MISSING_POLLER_EN_BIT,
+			INPUT_MISSING_POLLER_EN_BIT);
 	if (rc < 0) {
-		dev_err(chip->dev, "Couldn't disable input missing poller rc=%d\n",
+		dev_err(chip->dev, "Couldn't enable input missing poller rc=%d\n",
 				rc);
 		return rc;
 	}

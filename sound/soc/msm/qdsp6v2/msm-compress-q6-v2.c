@@ -619,7 +619,8 @@ static int msm_compr_get_partial_drain_delay(int frame_sz, int sample_rate)
 	delay_time_ms = delay_time_ms > PARTIAL_DRAIN_ACK_EARLY_BY_MSEC ?
 			delay_time_ms - PARTIAL_DRAIN_ACK_EARLY_BY_MSEC : 0;
 
-	pr_debug("%s: partial drain delay %d\n", __func__, delay_time_ms);
+	pr_debug("%s: frame_sz %d, sample_rate %d, partial drain delay %d\n",
+		__func__, frame_sz, sample_rate, delay_time_ms);
 	return delay_time_ms;
 }
 
@@ -1263,6 +1264,12 @@ static int msm_compr_set_params(struct snd_compr_stream *cstream,
 	if (i == num_rates)
 		return -EINVAL;
 
+	memcpy(&prtd->codec_param, params, sizeof(struct snd_compr_params));
+	/* ToDo: remove duplicates */
+	prtd->num_channels = prtd->codec_param.codec.ch_in;
+	prtd->sample_rate = prtd->codec_param.codec.sample_rate;
+	pr_debug("%s: sample_rate %d\n", __func__, prtd->sample_rate);
+
 	if (prtd->codec_param.codec.compr_passthr >= 0 &&
 		prtd->codec_param.codec.compr_passthr <= 2)
 		prtd->compr_passthr = prtd->codec_param.codec.compr_passthr;
@@ -1380,12 +1387,6 @@ static int msm_compr_set_params(struct snd_compr_stream *cstream,
 	prtd->partial_drain_delay =
 		msm_compr_get_partial_drain_delay(frame_sz, prtd->sample_rate);
 
-	memcpy(&prtd->codec_param, params, sizeof(struct snd_compr_params));
-
-	/* ToDo: remove duplicates */
-	prtd->num_channels = prtd->codec_param.codec.ch_in;
-	prtd->sample_rate = prtd->codec_param.codec.sample_rate;
-	pr_debug("%s: sample_rate %d\n", __func__, prtd->sample_rate);
 	ret = msm_compr_configure_dsp(cstream);
 
 	return ret;
@@ -1500,16 +1501,27 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 		pr_debug("%s: SNDRV_PCM_TRIGGER_START\n", __func__);
 		atomic_set(&prtd->start, 1);
 
-		/* set volume for the stream before RUN */
-		rc = msm_compr_set_volume(cstream, volume[0], volume[1]);
-		if (rc)
-			pr_err("%s : Set Volume failed : %d\n",
-				__func__, rc);
+		/*
+		* compr_set_volume and compr_init_pp_params
+		* are used to configure ASM volume hence not
+		* needed for compress passthrough playback.
+		*
+		* compress passthrough volume is controlled in
+		* ADM by adm_send_compressed_device_mute()
+		*/
+		if (prtd->compr_passthr == LEGACY_PCM) {
+			/* set volume for the stream before RUN */
+			rc = msm_compr_set_volume(cstream,
+				volume[0], volume[1]);
+			if (rc)
+				pr_err("%s : Set Volume failed : %d\n",
+					__func__, rc);
 
-		rc = msm_compr_init_pp_params(cstream, ac);
-		if (rc)
-			pr_err("%s : init PP params failed : %d\n",
-				__func__, rc);
+			rc = msm_compr_init_pp_params(cstream, ac);
+			if (rc)
+				pr_err("%s : init PP params failed : %d\n",
+					__func__, rc);
+		}
 
 		/* issue RUN command for the stream */
 		q6asm_run_nowait(prtd->audio_client, 0, 0, 0);
@@ -2685,7 +2697,35 @@ static int msm_compr_app_type_cfg_put(struct snd_kcontrol *kcontrol,
 static int msm_compr_app_type_cfg_get(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol)
 {
-	return 0;
+	u64 fe_id = kcontrol->private_value;
+	int ret = 0;
+	int app_type;
+	int acdb_dev_id;
+	int sample_rate;
+
+	pr_debug("%s: fe_id- %llu\n", __func__, fe_id);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %llu\n",
+			__func__, fe_id);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = msm_pcm_routing_get_stream_app_type_cfg(fe_id, &app_type,
+		&acdb_dev_id, &sample_rate);
+	if (ret < 0) {
+		pr_err("%s: msm_pcm_routing_get_stream_app_type_cfg failed returned %d\n",
+			__func__, ret);
+		goto done;
+	}
+
+	ucontrol->value.integer.value[0] = app_type;
+	ucontrol->value.integer.value[1] = acdb_dev_id;
+	ucontrol->value.integer.value[2] = sample_rate;
+	pr_debug("%s: fedai_id %llu, app_type %d, acdb_dev_id %d, sample_rate %d\n",
+		__func__, fe_id, app_type, acdb_dev_id, sample_rate);
+done:
+	return ret;
 }
 
 static int msm_compr_channel_map_put(struct snd_kcontrol *kcontrol,

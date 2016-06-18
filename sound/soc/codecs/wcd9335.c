@@ -107,7 +107,7 @@
 /* Convert from vout ctl to micbias voltage in mV */
 #define WCD_VOUT_CTL_TO_MICB(v) (1000 + v * 50)
 
-#define TASHA_ZDET_NUM_MEASUREMENTS 60
+#define TASHA_ZDET_NUM_MEASUREMENTS 150
 #define TASHA_MBHC_GET_C1(c)  ((c & 0xC000) >> 14)
 #define TASHA_MBHC_GET_X1(x)  (x & 0x3FFF)
 /* z value compared in milliOhm */
@@ -1647,11 +1647,15 @@ static inline void tasha_mbhc_get_result_params(struct wcd9xxx *wcd9xxx,
 				WCD9335_ANA_MBHC_ZDET, 0x20, 0x00);
 	x1 = TASHA_MBHC_GET_X1(val);
 	c1 = TASHA_MBHC_GET_C1(val);
+	/* If ramp is not complete, give additional 5ms */
+	if ((c1 < 2) && x1)
+		usleep_range(5000, 5050);
+
 	if (!c1 || !x1) {
 		dev_dbg(wcd9xxx->dev,
 			"%s: Impedance detect ramp error, c1=%d, x1=0x%x\n",
 			__func__, c1, x1);
-		return;
+		goto ramp_down;
 	}
 	d1 = d1_a[c1];
 	denom = (x1 * d1) - (1 << (14 - noff));
@@ -1662,6 +1666,7 @@ static inline void tasha_mbhc_get_result_params(struct wcd9xxx *wcd9xxx,
 
 	dev_dbg(wcd9xxx->dev, "%s: d1=%d, c1=%d, x1=0x%x, z_val=%d(milliOhm)\n",
 		__func__, d1, c1, x1, *zdet);
+ramp_down:
 	i = 0;
 	while (x1) {
 		wcd9xxx_bulk_read(&wcd9xxx->core_res,
@@ -3760,12 +3765,16 @@ static int tasha_codec_enable_hphr_pa(struct snd_soc_dapm_widget *w,
 		set_bit(HPH_PA_DELAY, &tasha->status_mask);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
-		if ((snd_soc_read(codec, WCD9335_ANA_HPH) & 0xC0) != 0xC0)
-			/* If PA_EN is not set (potentially in ANC case) then
-			 * do nothing for POST_PMU and let left channel handle
-			 * everything.
-			 */
-			break;
+		if (!(strcmp(w->name, "ANC HPHR PA"))) {
+			if ((snd_soc_read(codec, WCD9335_ANA_HPH) & 0xC0)
+							!= 0xC0)
+				/*
+				 * If PA_EN is not set (potentially in ANC case)
+				 * then do nothing for POST_PMU and let left
+				 * channel handle everything.
+				 */
+				break;
+		}
 		/*
 		 * 7ms sleep is required after PA is enabled as per
 		 * HW requirement
@@ -3848,12 +3857,16 @@ static int tasha_codec_enable_hphl_pa(struct snd_soc_dapm_widget *w,
 		set_bit(HPH_PA_DELAY, &tasha->status_mask);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
-		if ((snd_soc_read(codec, WCD9335_ANA_HPH) & 0xC0) != 0xC0)
-			/* If PA_EN is not set (potentially in ANC case) then
-			 * do nothing for POST_PMU and let right channel handle
-			 * everything.
-			 */
-			break;
+		if (!(strcmp(w->name, "ANC HPHL PA"))) {
+			if ((snd_soc_read(codec, WCD9335_ANA_HPH) & 0xC0)
+								!= 0xC0)
+				/*
+				 * If PA_EN is not set (potentially in ANC case)
+				 * then do nothing for POST_PMU and let right
+				 * channel handle everything.
+				 */
+				break;
+		}
 		/*
 		 * 7ms sleep is required after PA is enabled as per
 		 * HW requirement
@@ -5390,6 +5403,7 @@ static int tasha_codec_enable_dec(struct snd_soc_dapm_widget *w,
 	char *wname;
 	int ret = 0, amic_n;
 	u16 tx_vol_ctl_reg, pwr_level_reg = 0, dec_cfg_reg, hpf_gate_reg;
+	u16 tx_gain_ctl_reg;
 	char *dec;
 	u8 hpf_cut_off_freq;
 	struct tasha_priv *tasha = snd_soc_codec_get_drvdata(codec);
@@ -5432,6 +5446,7 @@ static int tasha_codec_enable_dec(struct snd_soc_dapm_widget *w,
 	tx_vol_ctl_reg = WCD9335_CDC_TX0_TX_PATH_CTL + 16 * decimator;
 	hpf_gate_reg = WCD9335_CDC_TX0_TX_PATH_SEC2 + 16 * decimator;
 	dec_cfg_reg = WCD9335_CDC_TX0_TX_PATH_CFG0 + 16 * decimator;
+	tx_gain_ctl_reg = WCD9335_CDC_TX0_TX_VOL_CTL + 16 * decimator;
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
@@ -5494,6 +5509,9 @@ static int tasha_codec_enable_dec(struct snd_soc_dapm_widget *w,
 			schedule_delayed_work(
 					&tasha->tx_hpf_work[decimator].dwork,
 					msecs_to_jiffies(300));
+		/* apply gain after decimator is enabled */
+		snd_soc_write(codec, tx_gain_ctl_reg,
+			      snd_soc_read(codec, tx_gain_ctl_reg));
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
 		hpf_cut_off_freq =
@@ -8443,6 +8461,14 @@ static const struct snd_kcontrol_new tasha_analog_gain_controls[] = {
 		line_gain),
 	SOC_SINGLE_TLV("HPHR Volume", WCD9335_HPH_R_EN, 0, 20, 1,
 		line_gain),
+	SOC_SINGLE_TLV("LINEOUT1 Volume", WCD9335_DIFF_LO_LO1_COMPANDER,
+			3, 16, 1, line_gain),
+	SOC_SINGLE_TLV("LINEOUT2 Volume", WCD9335_DIFF_LO_LO2_COMPANDER,
+			3, 16, 1, line_gain),
+	SOC_SINGLE_TLV("LINEOUT3 Volume", WCD9335_SE_LO_LO3_GAIN, 0, 20, 1,
+			line_gain),
+	SOC_SINGLE_TLV("LINEOUT4 Volume", WCD9335_SE_LO_LO4_GAIN, 0, 20, 1,
+			line_gain),
 
 	SOC_SINGLE_TLV("ADC1 Volume", WCD9335_ANA_AMIC1, 0, 20, 0,
 			analog_gain),
@@ -13243,8 +13269,8 @@ static int tasha_probe(struct platform_device *pdev)
 	struct wcd9xxx_power_region *cdc_pwr;
 
 	if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C) {
-		if (apr_get_modem_state() == APR_SUBSYS_DOWN) {
-			dev_err(&pdev->dev, "%s: modem down\n", __func__);
+		if (apr_get_subsys_state() == APR_SUBSYS_DOWN) {
+			dev_err(&pdev->dev, "%s: dsp down\n", __func__);
 			return -EPROBE_DEFER;
 		}
 	}
@@ -13274,7 +13300,7 @@ static int tasha_probe(struct platform_device *pdev)
 			       GFP_KERNEL);
 	if (!cdc_pwr) {
 		ret = -ENOMEM;
-		goto cdc_pwr_fail;
+		goto err_cdc_pwr;
 	}
 	tasha->wcd9xxx->wcd9xxx_pwr[WCD9XXX_DIG_CORE_REGION_1] = cdc_pwr;
 	cdc_pwr->pwr_collapse_reg_min = TASHA_DIG_CORE_REG_MIN;
@@ -13283,18 +13309,6 @@ static int tasha_probe(struct platform_device *pdev)
 				WCD_REGION_POWER_COLLAPSE_REMOVE,
 				WCD9XXX_DIG_CORE_REGION_1);
 
-	if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_SLIMBUS)
-		ret = snd_soc_register_codec(&pdev->dev, &soc_codec_dev_tasha,
-					     tasha_dai, ARRAY_SIZE(tasha_dai));
-	else if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C)
-		ret = snd_soc_register_codec(&pdev->dev, &soc_codec_dev_tasha,
-					     tasha_i2s_dai,
-					     ARRAY_SIZE(tasha_i2s_dai));
-	if (ret) {
-		dev_err(&pdev->dev, "%s: Codec registration failed\n",
-			__func__);
-		goto cdc_reg_fail;
-	}
 	/*
 	 * Init resource manager so that if child nodes such as SoundWire
 	 * requests for clock, resource manager can honor the request
@@ -13304,7 +13318,7 @@ static int tasha_probe(struct platform_device *pdev)
 		ret = PTR_ERR(resmgr);
 		dev_err(&pdev->dev, "%s: Failed to initialize wcd resmgr\n",
 			__func__);
-		goto unregister_codec;
+		goto err_resmgr;
 	}
 	tasha->resmgr = resmgr;
 	tasha->swr_plat_data.handle = (void *) tasha;
@@ -13319,7 +13333,7 @@ static int tasha_probe(struct platform_device *pdev)
 	if (IS_ERR(wcd_ext_clk)) {
 		dev_err(tasha->wcd9xxx->dev, "%s: clk get %s failed\n",
 			__func__, "wcd_ext_clk");
-		goto resmgr_remove;
+		goto err_clk;
 	}
 	tasha->wcd_ext_clk = wcd_ext_clk;
 	tasha->sido_voltage = SIDO_VOLTAGE_NOMINAL_MV;
@@ -13333,23 +13347,38 @@ static int tasha_probe(struct platform_device *pdev)
 			__func__, "wcd_native_clk");
 	else
 		tasha->wcd_native_clk = wcd_native_clk;
+
+	if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_SLIMBUS)
+		ret = snd_soc_register_codec(&pdev->dev, &soc_codec_dev_tasha,
+					     tasha_dai, ARRAY_SIZE(tasha_dai));
+	else if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C)
+		ret = snd_soc_register_codec(&pdev->dev, &soc_codec_dev_tasha,
+					     tasha_i2s_dai,
+					     ARRAY_SIZE(tasha_i2s_dai));
+	else
+		ret = -EINVAL;
+	if (ret) {
+		dev_err(&pdev->dev, "%s: Codec registration failed, ret = %d\n",
+			__func__, ret);
+		goto err_cdc_reg;
+	}
 	/* Update codec register default values */
 	tasha_update_reg_defaults(tasha);
 	schedule_work(&tasha->swr_add_devices_work);
-
 	tasha_get_codec_ver(tasha);
 
+	dev_info(&pdev->dev, "%s: Tasha driver probe done\n", __func__);
 	return ret;
 
-resmgr_remove:
+err_cdc_reg:
+	clk_put(tasha->wcd_ext_clk);
+	if (tasha->wcd_native_clk)
+		clk_put(tasha->wcd_native_clk);
+err_clk:
 	wcd_resmgr_remove(tasha->resmgr);
-unregister_codec:
-	if ((wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_SLIMBUS) ||
-	    (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C))
-		snd_soc_unregister_codec(&pdev->dev);
-cdc_reg_fail:
+err_resmgr:
 	devm_kfree(&pdev->dev, cdc_pwr);
-cdc_pwr_fail:
+err_cdc_pwr:
 	devm_kfree(&pdev->dev, tasha);
 	return ret;
 }

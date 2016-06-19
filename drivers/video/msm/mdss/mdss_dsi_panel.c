@@ -26,8 +26,6 @@
 #include "mdss_dsi.h"
 #include "mdss_dba_utils.h"
 
-#include <linux/project_info.h>
-
 #define DT_CMD_HDR 6
 #define MIN_REFRESH_RATE 48
 #define DEFAULT_MDP_TRANSFER_TIME 14000
@@ -222,36 +220,6 @@ static void mdss_dsi_panel_bklt_dcs(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
 }
 
-static char acl_mode[2] = {0x55, 0x0};	/* DTYPE_DCS_WRITE1 */
-static struct dsi_cmd_desc acl_cmd = {
-	{DTYPE_DCS_WRITE1, 1, 0, 0, 1, sizeof(acl_mode)},
-	acl_mode
-};
-
-void mdss_dsi_panel_set_acl(struct mdss_dsi_ctrl_pdata *ctrl, int mode)
-{
-	struct dcs_cmd_req cmdreq;
-	struct mdss_panel_info *pinfo;
-
-	pinfo = &(ctrl->panel_data.panel_info);
-	if (pinfo->dcs_cmd_by_left) {
-		if (ctrl->ndx != DSI_CTRL_LEFT)
-			return;
-	}
-
-	pr_err("%s: level=%d\n", __func__, mode);
-
-	acl_mode[1] = (unsigned char)mode;
-	memset(&cmdreq, 0, sizeof(cmdreq));
-	cmdreq.cmds = &acl_cmd;
-	cmdreq.cmds_cnt = 1;
-	cmdreq.flags = CMD_REQ_COMMIT | CMD_CLK_CTRL;
-	cmdreq.rlen = 0;
-	cmdreq.cb = NULL;
-
-	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
-}
-
 static int mdss_dsi_request_gpios(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 {
 	int rc = 0;
@@ -301,64 +269,7 @@ rst_gpio_err:
 disp_en_gpio_err:
 	return rc;
 }
-static int lcd_power_request_gpios(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
-{
 
-	int rc = 0;
-
-	rc = gpio_request(ctrl_pdata->lcd_power_1v8_en, "lcd_1v8_en");
-	if (rc) {
-		pr_err("request lcd 1v8 en gpio failed, rc=%d\n",
-				rc);
-		goto lcd_1v8_gpio_err;
-	 }
-	return rc;
-
-lcd_1v8_gpio_err:
-	if (gpio_is_valid(ctrl_pdata->lcd_power_1v8_en))
-			gpio_free(ctrl_pdata->lcd_power_1v8_en);
- 	return rc;
-}
-
-int vendor_lcd_power_on(struct mdss_panel_data *pdata, int enable)
-{
-	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
-	struct mdss_panel_info *pinfo = NULL;
-	int rc = 0;
-
-	if (pdata == NULL) {
-		pr_err("%s: Invalid input data\n", __func__);
-		return -EINVAL;
-	}
-
-	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
-			panel_data);
-
-	if (!gpio_is_valid(ctrl_pdata->lcd_power_1v8_en)) {
-		pr_err("%s:%d, lcd 1v8 en line not configured\n",
-				__func__, __LINE__);
-		return rc;
-	}
-
-	pinfo = &(ctrl_pdata->panel_data.panel_info);
-
-	if (enable) {
-		rc = lcd_power_request_gpios(ctrl_pdata);
-		if (rc) {
-			pr_err("lcd power gpio request failed\n");
-			return rc;
-		}
-		gpio_set_value((ctrl_pdata->lcd_power_1v8_en), 1);
-		usleep_range(2 * 1000,2 * 1000);
-	}
-	else{
-		gpio_set_value((ctrl_pdata->lcd_power_1v8_en), 0);
-		usleep_range(5 * 1000,5 * 1000);
-		gpio_free(ctrl_pdata->lcd_power_1v8_en);
-	}
-	return rc;
-
-}
 int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 {
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
@@ -470,12 +381,10 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 			gpio_set_value((ctrl_pdata->disp_en_gpio), 0);
 			gpio_free(ctrl_pdata->disp_en_gpio);
 		}
-		usleep_range(10 * 1000,10 * 1000);
 		gpio_set_value((ctrl_pdata->rst_gpio), 0);
 		gpio_free(ctrl_pdata->rst_gpio);
 		if (gpio_is_valid(ctrl_pdata->mode_gpio))
 			gpio_free(ctrl_pdata->mode_gpio);
-			usleep_range(10 * 1000,10 * 1000);
 	}
 
 exit:
@@ -907,15 +816,6 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 {
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
 	struct mdss_dsi_ctrl_pdata *sctrl = NULL;
-	static int count = 1;
-
-	if(count || !bl_level){
-        printk("--------backlight level = %d---------\n",bl_level);
-		count = 0;
-		}
-
-	if(!bl_level)
-		count = 1;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -924,11 +824,13 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 
 	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
-    if (ctrl_pdata->high_brightness_panel){
-       pr_debug("%s goto backlight remap\n", __func__);
-       pre_brightness_setting = bl_level;
-       bl_level = backlight_remap(bl_level);
-    }
+
+	if (ctrl_pdata->high_brightness_panel){
+		pr_debug("%s goto backlight remap\n", __func__);
+		pre_brightness_setting = bl_level;
+		bl_level = backlight_remap(bl_level);
+	}
+
 	/*
 	 * Some backlight controllers specify a minimum duty cycle
 	 * for the backlight brightness. If the brightness is less
@@ -1010,8 +912,7 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 
 	if (on_cmds->cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, on_cmds, CMD_REQ_COMMIT);
-	if(ctrl->acl_mode)
-		mdss_dsi_panel_set_acl(ctrl,ctrl->acl_mode);
+
 	if (pinfo->compression_mode == COMPRESSION_DSC)
 		mdss_dsi_panel_dsc_pps_send(ctrl, pinfo);
 
@@ -1057,7 +958,7 @@ static int mdss_dsi_post_panel_on(struct mdss_panel_data *pdata)
 	}
 
 end:
-	pr_err("%s:-\n", __func__);
+	pr_debug("%s:-\n", __func__);
 	return 0;
 }
 
@@ -2668,10 +2569,7 @@ int mdss_dsi_panel_init(struct device_node *node,
 	int rc = 0;
 	static const char *panel_name;
 	struct mdss_panel_info *pinfo;
-	static const char *panel_manufacture;
-	static const char *panel_version;
-	static const char *backlight_manufacture;
-	static const char *backlight_version;
+
 	if (!node || !ctrl_pdata) {
 		pr_err("%s: Invalid arguments\n", __func__);
 		return -ENODEV;
@@ -2698,26 +2596,10 @@ int mdss_dsi_panel_init(struct device_node *node,
 	pinfo->dynamic_switch_pending = false;
 	pinfo->is_lpm_mode = false;
 	pinfo->esd_rdy = false;
-	panel_manufacture = of_get_property(node, "qcom,mdss-dsi-panel-manufacture", NULL);
-	if (!panel_manufacture)
-		pr_info("%s:%d, panel manufacture not specified\n", __func__, __LINE__);
-	else
-		pr_info("%s: Panel Manufacture = %s\n", __func__, panel_manufacture);
-	panel_version = of_get_property(node, "qcom,mdss-dsi-panel-version", NULL);
-	if (!panel_version)
-		pr_info("%s:%d, panel version not specified\n", __func__, __LINE__);
-	else
-		pr_info("%s: Panel Version = %s\n", __func__, panel_version);
-
-	backlight_version = of_get_property(node, "qcom,mdss-dsi-backlight-version", NULL);
-	backlight_manufacture =of_get_property(node, "qcom,mdss-dsi-backlight-manufacture", NULL);
-
-	push_component_info(LCD, (char *)panel_version, (char *)panel_manufacture);
-	push_component_info(BACKLIGHT, (char *)backlight_version, (char *)backlight_manufacture);
 
 	ctrl_pdata->high_brightness_panel= of_property_read_bool(node,
-					"qcom,mdss-dsi-high-brightness-panel");
-    pr_err("high brightness panel: %d\n", ctrl_pdata->high_brightness_panel);
+			"qcom,mdss-dsi-high-brightness-panel");
+
 	ctrl_pdata->on = mdss_dsi_panel_on;
 	ctrl_pdata->post_panel_on = mdss_dsi_post_panel_on;
 	ctrl_pdata->off = mdss_dsi_panel_off;

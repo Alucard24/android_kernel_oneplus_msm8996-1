@@ -765,6 +765,7 @@ int mdss_dsi_clk_req_state(void *client, enum mdss_dsi_clk_type clk,
 	pr_debug("[%s]%s: CLK=%d, new_state=%d, core=%d, linkl=%d\n",
 	       c->name, mngr->name, clk, state, c->core_clk_state,
 	       c->link_clk_state);
+
 	MDSS_XLOG(index, clk, state, c->core_clk_state, c->link_clk_state);
 	/*
 	 * Refcount handling rules:
@@ -832,6 +833,7 @@ int mdss_dsi_clk_req_state(void *client, enum mdss_dsi_clk_type clk,
 		 c->name, mngr->name, changed, c->core_refcount,
 		 c->core_clk_state, c->link_refcount, c->link_clk_state);
 	MDSS_XLOG(index, clk, state, c->core_clk_state, c->link_clk_state);
+
 	if (changed) {
 		rc = dsi_recheck_clk_state(mngr);
 		if (rc)
